@@ -63,7 +63,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
         private readonly Http2ConnectionContext _context;
         private readonly Http2FrameWriter _frameWriter;
         private readonly HPackDecoder _hpackDecoder;
-        private readonly InputFlowControl _inputFlowControl = new InputFlowControl(Http2PeerSettings.DefaultInitialWindowSize, Http2PeerSettings.DefaultInitialWindowSize / 2);
+        private readonly InputFlowControl _inputFlowControl;
         private readonly OutputFlowControl _outputFlowControl = new OutputFlowControl(Http2PeerSettings.DefaultInitialWindowSize);
 
         private readonly Http2PeerSettings _serverSettings = new Http2PeerSettings();
@@ -93,6 +93,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
             _serverSettings.HeaderTableSize = (uint)context.ServiceContext.ServerOptions.Limits.Http2.HeaderTableSize;
             _hpackDecoder = new HPackDecoder((int)_serverSettings.HeaderTableSize);
             _serverSettings.MaxHeaderListSize = (uint)context.ServiceContext.ServerOptions.Limits.MaxRequestHeadersTotalSize;
+            _serverSettings.InitialWindowSize = (uint)context.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            _inputFlowControl = new InputFlowControl(_serverSettings.InitialWindowSize, _serverSettings.InitialWindowSize / 2);
         }
 
         public string ConnectionId => _context.ConnectionId;
@@ -180,6 +182,13 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                 if (_state != Http2ConnectionState.Closed)
                 {
                     await _frameWriter.WriteSettingsAsync(_serverSettings.GetNonProtocolDefaults());
+                    // Inform the client that the connection window is larger than the default. It can't be lowered here,
+                    // It can only be lowered by not issuing window updates after data is received.
+                    var diff = (int)_serverSettings.InitialWindowSize - (int)Http2PeerSettings.DefaultInitialWindowSize;
+                    if (diff > 0)
+                    {
+                        await _frameWriter.WriteWindowUpdateAsync(0, diff);
+                    }
                 }
 
                 while (_state != Http2ConnectionState.Closed)
@@ -538,6 +547,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http2
                     RemoteEndPoint = _context.RemoteEndPoint,
                     StreamLifetimeHandler = this,
                     ClientPeerSettings = _clientSettings,
+                    ServerPeerSettings = _serverSettings,
                     FrameWriter = _frameWriter,
                     ConnectionInputFlowControl = _inputFlowControl,
                     ConnectionOutputFlowControl = _outputFlowControl,

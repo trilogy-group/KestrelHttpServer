@@ -102,7 +102,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             _connectionContext.ServiceContext.ServerOptions.Limits.Http2.MaxFrameSize = length;
             _connection = new Http2Connection(_connectionContext);
 
-            await InitializeConnectionAsync(_echoApplication, expectedSettingsCount: 3);
+            await InitializeConnectionAsync(_echoApplication, expectedSettingsCount: 4);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
             await SendDataAsync(1, new byte[length], endStream: true);
@@ -182,31 +182,42 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         }
 
         [Fact]
-        public async Task DATA_Received_GreaterThanDefaultInitialWindowSize_ReadByStream()
+        public async Task DATA_Received_GreaterThanInitialWindowSize_ReadByStream()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
 
-            // Double the client stream windows to 128KiB so no stream WINDOW_UPDATEs need to be sent.
-            _clientSettings.InitialWindowSize = Http2PeerSettings.DefaultInitialWindowSize * 2;
+            // Grow the client stream windows so no stream WINDOW_UPDATEs need to be sent.
+            _clientSettings.InitialWindowSize = int.MaxValue;
 
             await InitializeConnectionAsync(_echoApplication);
 
-            // Double the client connection window to 128KiB.
-            await SendWindowUpdateAsync(0, (int)Http2PeerSettings.DefaultInitialWindowSize);
+            // Grow the client connection windows so no connection WINDOW_UPDATEs need to be sent.
+            await SendWindowUpdateAsync(0, int.MaxValue - (int)Http2PeerSettings.DefaultInitialWindowSize);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+
+            // Rounds down so we don't go over the half window size and trigger an update
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
 
             await ExpectAsync(Http2FrameType.HEADERS,
                 withLength: 37,
                 withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,
                 withStreamId: 1);
 
-            var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: _maxData.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
+            var dataFrames = new List<Http2FrameWithPayload>();
+
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
+                    withLength: _maxData.Length,
+                    withFlags: (byte)Http2DataFrameFlags.NONE,
+                    withStreamId: 1);
+                dataFrames.Add(dataFrame1);
+            }
 
             // Writing over half the initial window size induces both a connection-level and stream-level window update.
             await SendDataAsync(1, _maxData, endStream: false);
@@ -224,14 +235,22 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 1);
+            dataFrames.Add(dataFrame2);
 
-            await SendDataAsync(1, _maxData, endStream: false);
+            // No update expected for these
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
 
-            var dataFrame3 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: _maxData.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
+                var dataFrame3 = await ExpectAsync(Http2FrameType.DATA,
+                    withLength: _maxData.Length,
+                    withFlags: (byte)Http2DataFrameFlags.NONE,
+                    withStreamId: 1);
+                dataFrames.Add(dataFrame3);
+            }
 
+            // Writing over half the initial window size induces both a connection-level and stream-level window update.
+            // Ending the stream prevents additional stream updates
             await SendDataAsync(1, _maxData, endStream: true);
 
             var connectionWindowUpdateFrame2 = await ExpectAsync(Http2FrameType.WINDOW_UPDATE,
@@ -243,6 +262,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 1);
+            dataFrames.Add(dataFrame4);
             await ExpectAsync(Http2FrameType.DATA,
                 withLength: 0,
                 withFlags: (byte)Http2DataFrameFlags.END_STREAM,
@@ -250,13 +270,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
 
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame1.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame2.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame3.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame4.PayloadSequence.ToArray()));
-            Assert.Equal(_maxData.Length * 2, streamWindowUpdateFrame1.WindowUpdateSizeIncrement);
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame1.WindowUpdateSizeIncrement);
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame2.WindowUpdateSizeIncrement);
+            foreach (var frame in dataFrames)
+            {
+                Assert.True(_maxData.AsSpan().SequenceEqual(frame.PayloadSequence.ToArray()));
+            }
+            var updateSize = ((framesInWindow / 2) + 1) * _maxData.Length;
+            Assert.Equal(updateSize, streamWindowUpdateFrame1.WindowUpdateSizeIncrement);
+            Assert.Equal(updateSize, connectionWindowUpdateFrame1.WindowUpdateSizeIncrement);
+            Assert.Equal(updateSize, connectionWindowUpdateFrame2.WindowUpdateSizeIncrement);
         }
 
         [Fact]
@@ -358,31 +379,42 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         }
 
         [Fact]
-        public async Task DATA_Received_Multiplexed_GreaterThanDefaultInitialWindowSize_ReadByStream()
+        public async Task DATA_Received_Multiplexed_GreaterThanInitialWindowSize_ReadByStream()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
 
-            // Double the client stream windows to 128KiB so no stream WINDOW_UPDATEs need to be sent.
-            _clientSettings.InitialWindowSize = Http2PeerSettings.DefaultInitialWindowSize * 2;
+            // Grow the client stream windows so no stream WINDOW_UPDATEs need to be sent.
+            _clientSettings.InitialWindowSize = int.MaxValue;
 
             await InitializeConnectionAsync(_echoApplication);
 
-            // Double the client connection window to 128KiB.
-            await SendWindowUpdateAsync(0, (int)Http2PeerSettings.DefaultInitialWindowSize);
+            // Grow the client connection windows so no connection WINDOW_UPDATEs need to be sent.
+            await SendWindowUpdateAsync(0, int.MaxValue - (int)Http2PeerSettings.DefaultInitialWindowSize);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+
+            // Rounds down so we don't go over the half window size and trigger an update
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
 
             await ExpectAsync(Http2FrameType.HEADERS,
                 withLength: 37,
                 withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,
                 withStreamId: 1);
 
-            var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: _maxData.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
+            var dataFrames = new List<Http2FrameWithPayload>();
+
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
+                    withLength: _maxData.Length,
+                    withFlags: (byte)Http2DataFrameFlags.NONE,
+                    withStreamId: 1);
+                dataFrames.Add(dataFrame1);
+            }
 
             // Writing over half the initial window size induces both a connection-level and stream-level window update.
             await SendDataAsync(1, _maxData, endStream: false);
@@ -400,13 +432,19 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 1);
+            dataFrames.Add(dataFrame2);
 
-            await SendDataAsync(1, _maxData, endStream: false);
+            // No update expected for these
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
 
-            var dataFrame3 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: _maxData.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
+                var dataFrame3 = await ExpectAsync(Http2FrameType.DATA,
+                    withLength: _maxData.Length,
+                    withFlags: (byte)Http2DataFrameFlags.NONE,
+                    withStreamId: 1);
+                dataFrames.Add(dataFrame3);
+            }
 
             // Uploading data to a new stream induces a second connection-level but not stream-level window update.
             await StartStreamAsync(3, _browserRequestHeaders, endStream: false);
@@ -426,17 +464,20 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 3);
+            dataFrames.Add(dataFrame4);
             await ExpectAsync(Http2FrameType.DATA,
                 withLength: 0,
                 withFlags: (byte)Http2DataFrameFlags.END_STREAM,
                 withStreamId: 3);
 
+            // Would trigger a stream window update, except it's the last frame.
             await SendDataAsync(1, _maxData, endStream: true);
 
             var dataFrame5 = await ExpectAsync(Http2FrameType.DATA,
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 1);
+            dataFrames.Add(dataFrame5);
             await ExpectAsync(Http2FrameType.DATA,
                 withLength: 0,
                 withFlags: (byte)Http2DataFrameFlags.END_STREAM,
@@ -444,16 +485,14 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 3, ignoreNonGoAwayFrames: false);
 
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame1.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame2.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame3.PayloadSequence.ToArray()));
-            Assert.Equal(_maxData.Length * 2, streamWindowUpdateFrame.WindowUpdateSizeIncrement);
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame1.WindowUpdateSizeIncrement);
-
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame4.PayloadSequence.ToArray()));
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame2.WindowUpdateSizeIncrement);
-
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame5.PayloadSequence.ToArray()));
+            foreach (var frame in dataFrames)
+            {
+                Assert.True(_maxData.AsSpan().SequenceEqual(frame.PayloadSequence.ToArray()));
+            }
+            var updateSize = ((framesInWindow / 2) + 1) * _maxData.Length;
+            Assert.Equal(updateSize, streamWindowUpdateFrame.WindowUpdateSizeIncrement);
+            Assert.Equal(updateSize, connectionWindowUpdateFrame1.WindowUpdateSizeIncrement);
+            Assert.Equal(updateSize, connectionWindowUpdateFrame2.WindowUpdateSizeIncrement);
         }
 
         [Fact]
@@ -557,27 +596,46 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         [InlineData(255)]
         public async Task DATA_Received_WithPadding_CountsTowardsInputFlowControl(byte padLength)
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
-
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
             var maxDataMinusPadding = _maxData.AsMemory(0, _maxData.Length - padLength - 1);
+
+            // Grow the client stream windows so no stream WINDOW_UPDATEs need to be sent.
+            _clientSettings.InitialWindowSize = int.MaxValue;
 
             await InitializeConnectionAsync(_echoApplication);
 
+            // Grow the client connection windows so no connection WINDOW_UPDATEs need to be sent.
+            await SendWindowUpdateAsync(0, int.MaxValue - (int)Http2PeerSettings.DefaultInitialWindowSize);
+
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataWithPaddingAsync(1, maxDataMinusPadding, padLength, endStream: false);
+            var dataSent = 0;
+            // Rounds down so we don't go over the half window size and trigger an update
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataWithPaddingAsync(1, maxDataMinusPadding, padLength, endStream: false);
+                dataSent += maxDataMinusPadding.Length;
+            }
 
             await ExpectAsync(Http2FrameType.HEADERS,
                 withLength: 37,
                 withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,
                 withStreamId: 1);
 
-            var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: maxDataMinusPadding.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
+            // The frames come back in various sizes depending on the pipe buffers, and without the padding we sent.
+            while (dataSent > 0)
+            {
+                var frame = await ReceiveFrameAsync();
+                Assert.Equal(Http2FrameType.DATA, frame.Type);
+                Assert.True(dataSent >= frame.PayloadLength);
+                Assert.Equal(Http2DataFrameFlags.NONE, frame.DataFlags);
+                Assert.Equal(1, frame.StreamId);
+
+                dataSent -= frame.PayloadLength;
+            }
 
             // Writing over half the initial window size induces both a connection-level and stream-level window update.
+            // Except this is the last frame so only the connection one is sent
             await SendDataAsync(1, _maxData, endStream: true);
 
             var connectionWindowUpdateFrame = await ExpectAsync(Http2FrameType.WINDOW_UPDATE,
@@ -585,10 +643,11 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 0);
 
-            var dataFrame2 = await ExpectAsync(Http2FrameType.DATA,
+            var dataFrame3 = await ExpectAsync(Http2FrameType.DATA,
                 withLength: _maxData.Length,
                 withFlags: (byte)Http2DataFrameFlags.NONE,
                 withStreamId: 1);
+
             await ExpectAsync(Http2FrameType.DATA,
                 withLength: 0,
                 withFlags: (byte)Http2DataFrameFlags.END_STREAM,
@@ -596,22 +655,25 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
 
-            Assert.True(maxDataMinusPadding.Span.SequenceEqual(dataFrame1.PayloadSequence.ToArray()));
-            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame2.PayloadSequence.ToArray()));
+            Assert.True(_maxData.AsSpan().SequenceEqual(dataFrame3.PayloadSequence.ToArray()));
 
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
+            var updateSize = ((framesInWindow / 2) + 1) * _maxData.Length;
+            Assert.Equal(updateSize, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
         }
 
         [Fact]
         public async Task DATA_Received_ButNotConsumedByApp_CountsTowardsInputFlowControl()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
 
             await InitializeConnectionAsync(_noopApplication);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
 
             await ExpectAsync(Http2FrameType.HEADERS,
                 withLength: 55,
@@ -622,7 +684,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 withFlags: (byte)Http2DataFrameFlags.END_STREAM,
                 withStreamId: 1);
 
-            // Writing over half the initial window size induces both a connection-level window update.
+            // Writing over half the initial window size induces a connection-level window update.
+            // But no stream window update since this is the last frame.
             await SendDataAsync(1, _maxData, endStream: true);
 
             var connectionWindowUpdateFrame = await ExpectAsync(Http2FrameType.WINDOW_UPDATE,
@@ -632,7 +695,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
 
-            Assert.Equal(_maxData.Length * 2, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
+            var updateSize = ((framesInWindow / 2) + 1) * _maxData.Length;
+            Assert.Equal(updateSize, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
         }
 
         [Fact]
@@ -822,17 +886,17 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         [Fact]
         public async Task DATA_Received_NoStreamWindowSpace_ConnectionError()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = (initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize) + 1; // Round up to overflow the window
 
             await InitializeConnectionAsync(_waitForAbortApplication);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
 
-            await SendDataAsync(1, _maxData, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+            for (var i = 0; i < framesInWindow; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
 
             await WaitForConnectionErrorAsync<Http2ConnectionErrorException>(
                 ignoreNonGoAwayFrames: false,
@@ -844,17 +908,23 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         [Fact]
         public async Task DATA_Received_NoConnectionWindowSpace_ConnectionError()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
 
             await InitializeConnectionAsync(_waitForAbortApplication);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
 
             await StartStreamAsync(3, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(3, _maxData, endStream: false);
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(3, _maxData, endStream: false);
+            }
+            // One extra to overflow the connection window
             await SendDataAsync(3, _maxData, endStream: false);
 
             await WaitForConnectionErrorAsync<Http2ConnectionErrorException>(
@@ -1956,14 +2026,18 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
         [Fact]
         public async Task RST_STREAM_Received_ReturnsSpaceToConnectionInputFlowControlWindow()
         {
-            // _maxData should be 1/4th of the default initial window size + 1.
-            Assert.Equal(Http2PeerSettings.DefaultInitialWindowSize + 1, (uint)_maxData.Length * 4);
+            var initialWindowSize = _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize;
+            var framesInWindow = initialWindowSize / Http2PeerSettings.DefaultMaxFrameSize;
 
             await InitializeConnectionAsync(_waitForAbortApplication);
 
             await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
-            await SendDataAsync(1, _maxData, endStream: false);
+            // Rounds down so we don't go over the half window size and trigger an update
+            for (var i = 0; i < framesInWindow / 2; i++)
+            {
+                await SendDataAsync(1, _maxData, endStream: false);
+            }
+            // Writing over half the initial window size induces both a connection-level and stream-level window update.
             await SendDataAsync(1, _maxData, endStream: false);
 
             await SendRstStreamAsync(1);
@@ -1977,7 +2051,8 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
 
             Assert.Contains(1, _abortedStreamIds);
-            Assert.Equal(_maxData.Length * 3, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
+            var updateSize = ((framesInWindow / 2) + 1) * _maxData.Length;
+            Assert.Equal(updateSize, connectionWindowUpdateFrame.WindowUpdateSizeIncrement);
         }
 
         [Fact]
@@ -2065,21 +2140,32 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             await SendSettingsAsync();
 
             var frame = await ExpectAsync(Http2FrameType.SETTINGS,
-                withLength: Http2FrameReader.SettingSize * 2,
+                withLength: Http2FrameReader.SettingSize * 3,
                 withFlags: 0,
                 withStreamId: 0);
 
             // Only non protocol defaults are sent
             var settings = Http2FrameReader.ReadSettings(frame.PayloadSequence);
-            Assert.Equal(2, settings.Count);
+            Assert.Equal(3, settings.Count);
 
             var setting = settings[0];
             Assert.Equal(Http2SettingsParameter.SETTINGS_MAX_CONCURRENT_STREAMS, setting.Parameter);
             Assert.Equal(100u, setting.Value);
 
             setting = settings[1];
+            Assert.Equal(Http2SettingsParameter.SETTINGS_INITIAL_WINDOW_SIZE, setting.Parameter);
+            Assert.Equal(96 * 1024u, setting.Value);
+
+            setting = settings[2];
             Assert.Equal(Http2SettingsParameter.SETTINGS_MAX_HEADER_LIST_SIZE, setting.Parameter);
             Assert.Equal(32 * 1024u, setting.Value);
+
+            var update = await ExpectAsync(Http2FrameType.WINDOW_UPDATE,
+                withLength: 4,
+                withFlags: (byte)Http2SettingsFrameFlags.NONE,
+                withStreamId: 0);
+
+            Assert.Equal(32_769, update.WindowUpdateSizeIncrement);
 
             await ExpectAsync(Http2FrameType.SETTINGS,
                 withLength: 0,
@@ -2088,12 +2174,53 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 0, ignoreNonGoAwayFrames: false);
         }
+        /*
+        [Fact]
+        public async Task SETTINGS_ServerInitialWindowSizeLowerThanDefault()
+        {
+            // Protocol default is 64kb.
+            _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize = 1024;
+            _connection = new Http2Connection(_connectionContext);
+            _connectionTask = _connection.ProcessRequestsAsync(new DummyApplication(_echoApplication));
 
+            await SendPreambleAsync().ConfigureAwait(false);
+            await SendSettingsAsync();
+
+            await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
+            // Send less data than the protocol default, but more than the server's current setting.
+            // We can send this prior to receiving the server's modified value, so it can't really enforce a lower limit until we ack it.
+            await SendDataAsync(1, _maxData, endStream: false);
+
+            await ExpectAsync(Http2FrameType.SETTINGS,
+                withLength: 3 * Http2FrameReader.SettingSize,
+                withFlags: 0,
+                withStreamId: 0);
+
+            await ExpectAsync(Http2FrameType.SETTINGS,
+                withLength: 0,
+                withFlags: (byte)Http2SettingsFrameFlags.ACK,
+                withStreamId: 0);
+
+            await ExpectAsync(Http2FrameType.HEADERS,
+                withLength: 37,
+                withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,
+                withStreamId: 1);
+
+            var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
+                withLength: _maxData.Length,
+                withFlags: (byte)Http2DataFrameFlags.NONE,
+                withStreamId: 1);
+
+            // TODO: This is going to blow up in our face, we'll need to prevent this.
+            await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
+        }
+        */
         [Fact]
         public async Task SETTINGS_Custom_Sent()
         {
             _connection.ServerSettings.MaxConcurrentStreams = 1;
             _connection.ServerSettings.MaxHeaderListSize = 4 * 1024;
+            _connection.ServerSettings.InitialWindowSize = 1024 * 1024 * 10;
 
             _connectionTask = _connection.ProcessRequestsAsync(new DummyApplication(_noopApplication));
 
@@ -2101,21 +2228,32 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             await SendSettingsAsync();
 
             var frame = await ExpectAsync(Http2FrameType.SETTINGS,
-                withLength: Http2FrameReader.SettingSize * 2,
+                withLength: Http2FrameReader.SettingSize * 3,
                 withFlags: 0,
                 withStreamId: 0);
 
             // Only non protocol defaults are sent
             var settings = Http2FrameReader.ReadSettings(frame.PayloadSequence);
-            Assert.Equal(2, settings.Count);
+            Assert.Equal(3, settings.Count);
 
             var setting = settings[0];
             Assert.Equal(Http2SettingsParameter.SETTINGS_MAX_CONCURRENT_STREAMS, setting.Parameter);
             Assert.Equal(1u, setting.Value);
 
             setting = settings[1];
+            Assert.Equal(Http2SettingsParameter.SETTINGS_INITIAL_WINDOW_SIZE, setting.Parameter);
+            Assert.Equal(1024 * 1024 * 10u, setting.Value);
+
+            setting = settings[2];
             Assert.Equal(Http2SettingsParameter.SETTINGS_MAX_HEADER_LIST_SIZE, setting.Parameter);
             Assert.Equal(4 * 1024u, setting.Value);
+
+            var update = await ExpectAsync(Http2FrameType.WINDOW_UPDATE,
+                withLength: 4,
+                withFlags: (byte)Http2SettingsFrameFlags.NONE,
+                withStreamId: 0);
+
+            Assert.Equal(1024 * 1024 * 10u - Http2PeerSettings.DefaultInitialWindowSize, (uint)update.WindowUpdateSizeIncrement);
 
             await ExpectAsync(Http2FrameType.SETTINGS,
                 withLength: 0,
@@ -2277,7 +2415,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
                 context.Response.Headers["A"] = new string('a', headerValueLength);
                 context.Response.Headers["B"] = new string('b', headerValueLength);
                 return context.Response.Body.WriteAsync(new byte[payloadLength], 0, payloadLength);
-            }, expectedSettingsCount: 3);
+            }, expectedSettingsCount: 4);
 
             // Update client settings
             _clientSettings.MaxFrameSize = (uint)payloadLength;
@@ -2323,7 +2461,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
             await InitializeConnectionAsync(context =>
             {
                 return context.Response.Body.WriteAsync(new byte[clientMaxFrame], 0, clientMaxFrame);
-            }, expectedSettingsCount: 3);
+            }, expectedSettingsCount: 4);
 
             // Start request
             await StartStreamAsync(1, _browserRequestHeaders, endStream: true);

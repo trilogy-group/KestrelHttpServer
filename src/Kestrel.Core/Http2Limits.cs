@@ -14,6 +14,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
         private int _maxStreamsPerConnection = 100;
         private int _headerTableSize = (int)Http2PeerSettings.DefaultHeaderTableSize;
         private int _maxFrameSize = (int)Http2PeerSettings.DefaultMaxFrameSize;
+        private int _initialWindowSize = 1024 * 96; // Larger than the default 64kb
 
         /// <summary>
         /// Limits the number of concurrent request streams per HTTP/2 connection. Excess streams will be refused.
@@ -72,6 +73,26 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
                 }
 
                 _maxFrameSize = value;
+            }
+        }
+
+        /// <summary>
+        /// Indicates how much request body data the server is willing to receive and buffer at a time per stream and per connection.
+        /// <para>
+        /// Value must be greater than 0 and less than 2^31, defaults to 96 kb.
+        /// </para>
+        /// </summary>
+        public int InitialWindowSize
+        {
+            get => _initialWindowSize;
+            set
+            {
+                if (value <= 0 || value > Http2PeerSettings.MaxWindowSize)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(value), value, CoreStrings.FormatArgumentOutOfRange(0, Http2PeerSettings.MaxWindowSize));
+                }
+
+                _initialWindowSize = value;
             }
         }
     }
