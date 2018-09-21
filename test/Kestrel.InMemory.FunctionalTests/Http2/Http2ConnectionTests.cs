@@ -2174,47 +2174,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core.Tests
 
             await StopConnectionAsync(expectedLastStreamId: 0, ignoreNonGoAwayFrames: false);
         }
-        /*
-        [Fact]
-        public async Task SETTINGS_ServerInitialWindowSizeLowerThanDefault()
-        {
-            // Protocol default is 64kb.
-            _connectionContext.ServiceContext.ServerOptions.Limits.Http2.InitialWindowSize = 1024;
-            _connection = new Http2Connection(_connectionContext);
-            _connectionTask = _connection.ProcessRequestsAsync(new DummyApplication(_echoApplication));
 
-            await SendPreambleAsync().ConfigureAwait(false);
-            await SendSettingsAsync();
-
-            await StartStreamAsync(1, _browserRequestHeaders, endStream: false);
-            // Send less data than the protocol default, but more than the server's current setting.
-            // We can send this prior to receiving the server's modified value, so it can't really enforce a lower limit until we ack it.
-            await SendDataAsync(1, _maxData, endStream: false);
-
-            await ExpectAsync(Http2FrameType.SETTINGS,
-                withLength: 3 * Http2FrameReader.SettingSize,
-                withFlags: 0,
-                withStreamId: 0);
-
-            await ExpectAsync(Http2FrameType.SETTINGS,
-                withLength: 0,
-                withFlags: (byte)Http2SettingsFrameFlags.ACK,
-                withStreamId: 0);
-
-            await ExpectAsync(Http2FrameType.HEADERS,
-                withLength: 37,
-                withFlags: (byte)Http2HeadersFrameFlags.END_HEADERS,
-                withStreamId: 1);
-
-            var dataFrame1 = await ExpectAsync(Http2FrameType.DATA,
-                withLength: _maxData.Length,
-                withFlags: (byte)Http2DataFrameFlags.NONE,
-                withStreamId: 1);
-
-            // TODO: This is going to blow up in our face, we'll need to prevent this.
-            await StopConnectionAsync(expectedLastStreamId: 1, ignoreNonGoAwayFrames: false);
-        }
-        */
         [Fact]
         public async Task SETTINGS_Custom_Sent()
         {

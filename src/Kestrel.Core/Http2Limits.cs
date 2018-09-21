@@ -79,7 +79,7 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
         /// <summary>
         /// Indicates how much request body data the server is willing to receive and buffer at a time per stream and per connection.
         /// <para>
-        /// Value must be greater than 0 and less than 2^31, defaults to 96 kb.
+        /// Value must be greater than or equal to 65,535 and less than 2^31, defaults to 96 kb.
         /// </para>
         /// </summary>
         public int InitialWindowSize
@@ -87,9 +87,10 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core
             get => _initialWindowSize;
             set
             {
-                if (value <= 0 || value > Http2PeerSettings.MaxWindowSize)
+                if (value < Http2PeerSettings.DefaultInitialWindowSize || value > Http2PeerSettings.MaxWindowSize)
                 {
-                    throw new ArgumentOutOfRangeException(nameof(value), value, CoreStrings.FormatArgumentOutOfRange(0, Http2PeerSettings.MaxWindowSize));
+                    throw new ArgumentOutOfRangeException(nameof(value), value,
+                        CoreStrings.FormatArgumentOutOfRange(Http2PeerSettings.DefaultInitialWindowSize, Http2PeerSettings.MaxWindowSize));
                 }
 
                 _initialWindowSize = value;
